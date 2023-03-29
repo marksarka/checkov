@@ -24,7 +24,7 @@ STACK_TAGS_TOKEN = 'stackTags' #nosec
 TAGS_TOKEN = 'tags' #nosec
 SUPPORTED_PROVIDERS = ['aws']
 
-DEFAULT_VAR_PATTERN = "\\${([^{}]+?)}"
+DEFAULT_VAR_PATTERN = r"\${([^{}]+?)}"
 QUOTED_WORD_SYNTAX = re.compile(r"(?:('|\").*?\1)")
 FILE_LOCATION_PATTERN = re.compile(r'^file\(([^?%*:|"<>]+?)\)')
 
@@ -51,7 +51,8 @@ def parse(filename):
     except UnicodeDecodeError:
         logger.error('Cannot read file contents: %s', filename)
         return
-    except YAMLError:
+    except YAMLError as e:
+        print(e)
         return
 
     process_variables(template, filename)

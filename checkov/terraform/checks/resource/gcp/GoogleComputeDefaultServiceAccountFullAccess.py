@@ -2,7 +2,7 @@ from checkov.common.models.enums import CheckResult, CheckCategories
 from checkov.terraform.checks.resource.base_resource_check import BaseResourceCheck
 import re
 
-DEFAULT_SERVICE_ACCOUNT = re.compile('\d+-compute@developer\.gserviceaccount\.com')
+DEFAULT_SERVICE_ACCOUNT = re.compile(r'\d+-compute@developer\.gserviceaccount\.com')
 FULL_ACCESS_API = 'https://www.googleapis.com/auth/cloud-platform'
 
 
@@ -22,7 +22,7 @@ class GoogleComputeDefaultServiceAccountFullAccess(BaseResourceCheck):
         :param conf: google_compute_instance configuration
         :return: <CheckResult>
         """
-        if conf['name'][0].startswith('gke-'):
+        if 'name' in conf and conf['name'][0].startswith('gke-'):
             return CheckResult.PASSED
         if 'service_account' in conf.keys():
             service_account_conf = conf['service_account'][0]

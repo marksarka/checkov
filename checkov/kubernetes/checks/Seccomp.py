@@ -2,6 +2,7 @@ import dpath
 
 from checkov.common.models.enums import CheckCategories, CheckResult
 from checkov.kubernetes.base_spec_check import BaseK8Check
+from checkov.common.util.type_forcers import force_list
 
 
 class Seccomp(BaseK8Check):
@@ -34,6 +35,20 @@ class Seccomp(BaseK8Check):
                 return CheckResult.PASSED if security_profile == 'RuntimeDefault' else CheckResult.FAILED
             if "metadata" in conf:
                 metadata = conf["metadata"]
+        if conf['kind'] == 'Deployment':
+            security_profile = dpath.search(conf, 'spec/template/spec/securityContext/seccompProfile/type')
+            if security_profile:
+                security_profile = dpath.get(conf, 'spec/template/spec/securityContext/seccompProfile/type')
+                return CheckResult.PASSED if security_profile == 'RuntimeDefault' else CheckResult.FAILED
+            if "metadata" in conf:
+                metadata = conf["metadata"]
+        if conf['kind'] == 'StatefulSet':
+            security_profile = dpath.search(conf, 'spec/template/spec/securityContext/seccompProfile/type')
+            if security_profile:
+                security_profile = dpath.get(conf, 'spec/template/spec/securityContext/seccompProfile/type')
+                return CheckResult.PASSED if security_profile == 'RuntimeDefault' else CheckResult.FAILED
+            if "metadata" in conf:
+                metadata = conf["metadata"]            
         elif conf['kind'] == 'CronJob':
             if "spec" in conf:
                 if "jobTemplate" in conf["spec"]:
@@ -42,17 +57,16 @@ class Seccomp(BaseK8Check):
                             if "metadata" in conf["spec"]["jobTemplate"]["spec"]["template"]:
                                 metadata = conf["spec"]["jobTemplate"]["spec"]["template"]["metadata"]
         else:
-            if "spec" in conf:
-                if "template" in conf["spec"]:
-                    if "metadata" in conf["spec"]["template"]:
-                        metadata = conf["spec"]["template"]["metadata"]
+            inner_metadata = self.get_inner_entry(conf, "metadata")
+            metadata = inner_metadata if inner_metadata else metadata
 
         if metadata:
-            if "annotations" in metadata and isinstance(metadata['annotations'], dict):
-                if "seccomp.security.alpha.kubernetes.io/pod" in metadata["annotations"]:
-                    if ("docker/default" in metadata["annotations"]["seccomp.security.alpha.kubernetes.io/pod"] or
-                            "runtime/default" in metadata["annotations"]["seccomp.security.alpha.kubernetes.io/pod"]):
-                        return CheckResult.PASSED
+            if metadata.get('annotations'):
+                for annotation in force_list(metadata["annotations"]):
+                    for key in annotation:
+                        if "seccomp.security.alpha.kubernetes.io/pod" in key:
+                            if "docker/default" in annotation[key] or "runtime/default" in annotation[key]:
+                                return CheckResult.PASSED
         return CheckResult.FAILED
 
 

@@ -17,11 +17,16 @@ class Record:
     code_block = ""
     file_path = ""
     file_line_range = []
+    caller_file_path = None           # When created from a module
+    caller_file_line_range = None     #
     resource = ""
     guideline = None
+    fixed_definition = None
+    entity_tags = None
 
     def __init__(self, check_id, check_name, check_result, code_block, file_path, file_line_range, resource,
-                 evaluations, check_class, file_abs_path):
+                 evaluations, check_class, file_abs_path, entity_tags=None,
+                 caller_file_path=None, caller_file_line_range=None, bc_check_id=None):
         """
         :param evaluations: A dict with the key being the variable name, value being a dict containing:
                              - 'var_file'
@@ -29,15 +34,21 @@ class Record:
                              - 'definitions', a list of dicts which contain 'definition_expression'
         """
         self.check_id = check_id
+        self.bc_check_id = bc_check_id
         self.check_name = check_name
         self.check_result = check_result
         self.code_block = code_block
         self.file_path = file_path
+        self.file_abs_path = file_abs_path
         self.repo_file_path = f'/{os.path.relpath(file_abs_path)}' # matches file paths given in the BC platform.
         self.file_line_range = file_line_range
         self.resource = resource
         self.evaluations = evaluations
         self.check_class = check_class
+        self.fixed_definition = None
+        self.entity_tags = entity_tags
+        self.caller_file_path = caller_file_path
+        self.caller_file_line_range = caller_file_line_range
 
     def set_guideline(self, guideline):
         self.guideline = guideline
@@ -63,7 +74,7 @@ class Record:
                 string_block += "\t\t" + Fore.WHITE + str(line_num) + spaces + ' | ' + Fore.YELLOW + line
         return string_block
 
-    def __str__(self):
+    def to_string(self, compact=False, use_bc_ids=False):
         status = ''
         evaluation_message = f''
         status_color = "white"
@@ -78,7 +89,7 @@ class Record:
             status_color = 'blue'
             suppress_comment = "\tSuppress comment: {}\n".format(self.check_result['suppress_comment'])
 
-        check_message = colored("Check: {}: \"{}\"\n".format(self.check_id, self.check_name), "white")
+        check_message = colored("Check: {}: \"{}\"\n".format(self.get_output_id(use_bc_ids), self.check_name), "white")
         guideline_message = ''
         if self.guideline:
             guideline_message = "\tGuide: " + Style.BRIGHT + colored(f"{self.guideline}\n", 'blue', attrs=['underline']) + Style.RESET_ALL
@@ -89,6 +100,12 @@ class Record:
         if self.code_block:
             code_lines = "\n{}\n".format("".join(
                 [self._code_line_string(self.code_block)]))
+        caller_file_details = ""
+        if self.caller_file_path and self.caller_file_line_range:
+            caller_file_details = colored(
+                "\tCalling File: {}:{}\n".format(self.caller_file_path,
+                                                 "-".join([str(x) for x in self.caller_file_line_range])),
+                "magenta")
         if self.evaluations:
             for (var_name, var_evaluations) in self.evaluations.items():
                 var_file = var_evaluations['var_file']
@@ -101,10 +118,19 @@ class Record:
                             f'in expression: {colored(definition_obj["definition_name"] + " = ", "yellow")}{colored(definition_obj["definition_expression"], "yellow")}\n',
                             'white')
         status_message = colored("\t{} for resource: {}\n".format(status, self.resource), status_color)
-        if self.check_result['result'] == CheckResult.FAILED and code_lines:
-            return check_message + status_message + file_details + guideline_message + code_lines + evaluation_message
+        if self.check_result['result'] == CheckResult.FAILED and code_lines and not compact:
+            return check_message + status_message + file_details + caller_file_details + guideline_message + code_lines + evaluation_message
 
         if self.check_result['result'] == CheckResult.SKIPPED:
-            return check_message + status_message + suppress_comment + file_details + guideline_message
+            return check_message + status_message + suppress_comment + file_details + caller_file_details + guideline_message
         else:
-            return check_message + status_message + file_details + evaluation_message + guideline_message
+            return check_message + status_message + file_details + caller_file_details + evaluation_message + guideline_message
+
+    def __str__(self):
+        return self.to_string()
+
+    def get_output_id(self, use_bc_ids: bool) -> str:
+        return self.bc_check_id if self.bc_check_id and use_bc_ids else self.check_id
+
+    def get_unique_string(self):
+        return f"{self.check_id}.{self.check_result}.{self.file_abs_path}.{self.file_line_range}.{self.resource}"

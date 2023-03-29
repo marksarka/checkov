@@ -1,45 +1,65 @@
+import copy
 import json
 import logging
 import os
 import re
+from copy import deepcopy
+import datetime
 from pathlib import Path
-from typing import Mapping, Optional, Dict, Any, List, Callable, Tuple
+from typing import Optional, Dict, Mapping, Set, Tuple, Callable, Any, List
+from json import dumps, loads, JSONEncoder
 
 import deep_merge
 import hcl2
-import jmespath
-from dataclasses import dataclass
+from lark import Tree
 
-from checkov.common.runners.base_runner import filter_ignored_directories
+from checkov.common.runners.base_runner import filter_ignored_paths
 from checkov.common.util.consts import DEFAULT_EXTERNAL_MODULES_DIR, RESOLVED_MODULE_ENTRY_NAME
-from checkov.common.util.type_forcers import convert_str_to_bool
-from checkov.common.variables.context import EvaluationContext, VarReference
-from checkov.terraform.module_loading.registry import ModuleLoaderRegistry
-from checkov.terraform.module_loading.registry import module_loader_registry as default_ml_registry
+from checkov.common.variables.context import EvaluationContext
+from checkov.terraform.checks.utils.dependency_path_handler import unify_dependency_path
+from checkov.terraform.graph_builder.graph_components.block_types import BlockType
+from checkov.terraform.graph_builder.graph_components.module import Module
+from checkov.terraform.graph_builder.utils import remove_module_dependency_in_path
+from checkov.terraform.module_loading.registry import module_loader_registry as default_ml_registry, \
+    ModuleLoaderRegistry
+from checkov.terraform.parser_utils import eval_string, find_var_blocks
+
+external_modules_download_path = os.environ.get('EXTERNAL_MODULES_DIR', DEFAULT_EXTERNAL_MODULES_DIR)
 
 
-LOGGER = logging.getLogger(__name__)
+class DefinitionsEncoder(JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, set):
+            return list(obj)
+        elif isinstance(obj, Tree):
+            return str(obj)
+        elif isinstance(obj, datetime.date):
+            return str(obj)
+        return super().default(obj)
 
-_SIMPLE_TYPES = frozenset(["string", "number", "bool"])
 
-_RESOURCE_REF_PATTERN = re.compile(r'[\d\w]+(\.[\d\w]+)+')
-
-
-def _filter_ignored_directories(d_names):
-    filter_ignored_directories(d_names)
-    [d_names.remove(d) for d in list(d_names) if d in [default_ml_registry.external_modules_folder_name]]
+def _filter_ignored_paths(root, paths, excluded_paths):
+    filter_ignored_paths(root, paths, excluded_paths)
+    [paths.remove(path) for path in list(paths) if path in [default_ml_registry.external_modules_folder_name]]
 
 
 class Parser:
-    def __init__(self):
+    def __init__(self, module_class=Module):
+        self.module_class = module_class
         self._parsed_directories = set()
+
+        # This ensures that we don't try to double-load modules
+        # Tuple is <file>, <module_index>, <name> (see _load_modules)
+        self._loaded_modules: Set[Tuple[str, int, str]] = set()
+        self.external_variables_data = []
 
     def _init(self, directory: str, out_definitions: Optional[Dict],
               out_evaluations_context: Dict[str, Dict[str, EvaluationContext]],
               out_parsing_errors: Dict[str, Exception],
               env_vars: Mapping[str, str],
               download_external_modules: bool,
-              external_modules_download_path: str, evaluate_variables):
+              external_modules_download_path: str,
+              excluded_paths: Optional[List[str]] = None):
         self.directory = directory
         self.out_definitions = out_definitions
         self.out_evaluations_context = out_evaluations_context
@@ -47,7 +67,6 @@ class Parser:
         self.env_vars = env_vars
         self.download_external_modules = download_external_modules
         self.external_modules_download_path = external_modules_download_path
-        self.evaluate_variables = evaluate_variables
 
         if self.out_evaluations_context is None:
             self.out_evaluations_context = {}
@@ -55,6 +74,7 @@ class Parser:
             self.out_parsing_errors = {}
         if self.env_vars is None:
             self.env_vars = dict(os.environ)
+        self.excluded_paths = excluded_paths
 
     def _check_process_dir(self, directory):
         if directory not in self._parsed_directories:
@@ -68,12 +88,13 @@ class Parser:
                         out_parsing_errors: Dict[str, Exception] = None,
                         env_vars: Mapping[str, str] = None,
                         download_external_modules: bool = False,
-                        external_modules_download_path: str = DEFAULT_EXTERNAL_MODULES_DIR, evaluate_variables=True):
-        self._init(directory, out_definitions, out_evaluations_context, out_parsing_errors, env_vars, download_external_modules, external_modules_download_path, evaluate_variables)
+                        external_modules_download_path: str = DEFAULT_EXTERNAL_MODULES_DIR,
+                        excluded_paths: Optional[List[str]] = None):
+        self._init(directory, out_definitions, out_evaluations_context, out_parsing_errors, env_vars,
+                   download_external_modules, external_modules_download_path, excluded_paths)
         self._parsed_directories.clear()
         default_ml_registry.download_external_modules = download_external_modules
         default_ml_registry.external_modules_folder_name = external_modules_download_path
-
         self._parse_directory(dir_filter=lambda d: self._check_process_dir(d))
 
     @staticmethod
@@ -109,18 +130,28 @@ class Parser:
                                            True will allow processing. The argument will be the absolute path of
                                            the directory.
         """
+        keys_referenced_as_modules: Set[str] = set()
 
         if include_sub_dirs:
             for sub_dir, d_names, f_names in os.walk(self.directory):
-                _filter_ignored_directories(d_names)
+                _filter_ignored_paths(sub_dir, d_names, self.excluded_paths)
+                _filter_ignored_paths(sub_dir, f_names, self.excluded_paths)
                 if dir_filter(os.path.abspath(sub_dir)):
-                    self._internal_dir_load(sub_dir, module_loader_registry, dir_filter)
+                    self._internal_dir_load(sub_dir, module_loader_registry, dir_filter,
+                                            keys_referenced_as_modules)
         else:
-            self._internal_dir_load(self.directory, module_loader_registry, dir_filter)
+            self._internal_dir_load(self.directory, module_loader_registry, dir_filter,
+                                    keys_referenced_as_modules)
+
+        # Ensure anything that was referenced as a module is removed
+        for key in keys_referenced_as_modules:
+            if key in self.out_definitions:
+                del self.out_definitions[key]
 
     def _internal_dir_load(self, directory: str,
                            module_loader_registry: ModuleLoaderRegistry,
                            dir_filter: Callable[[str], bool],
+                           keys_referenced_as_modules: Set[str],
                            specified_vars: Optional[Mapping[str, str]] = None,
                            module_load_context: Optional[str] = None):
         """
@@ -143,7 +174,7 @@ class Parser:
         var_value_and_file_map: Dict[str, Tuple[Any, str]] = {}
         hcl_tfvars: Optional[os.DirEntry] = None
         json_tfvars: Optional[os.DirEntry] = None
-        auto_vars_files: Optional[List[os.DirEntry]] = None      # lazy creation
+        auto_vars_files: Optional[List[os.DirEntry]] = None  # lazy creation
         for file in os.scandir(directory):
             # Ignore directories and hidden files
             try:
@@ -169,12 +200,12 @@ class Parser:
                 continue
 
             # Resource files
-            if file.name.endswith(".tf.json") or file.name.endswith(".tf"):
+            if file.name.endswith(".tf"):  # TODO: add support for .tf.json
                 data = _load_or_die_quietly(file, self.out_parsing_errors)
             else:
                 continue
 
-            if not data:        # failed loads or empty files
+            if not data:  # failed loads or empty files
                 continue
 
             self.out_definitions[file.path] = data
@@ -192,6 +223,7 @@ class Parser:
 
                         default_value = var_definition.get("default")
                         if default_value is not None and isinstance(default_value, list):
+                            self.external_variables_data.append((var_name, default_value[0], file.path))
                             var_value_and_file_map[var_name] = default_value[0], file.path
 
         # Stage 2: Load vars in proper order:
@@ -205,25 +237,31 @@ class Parser:
         #               their filenames.
         #          Overriding everything else, variables form `specified_vars`, which are considered
         #          directly set.
-        for key, value in self.env_vars.items():                                 # env vars
+        for key, value in self.env_vars.items():  # env vars
             if not key.startswith("TF_VAR_"):
                 continue
             var_value_and_file_map[key[7:]] = value, f"env:{key}"
-        if hcl_tfvars:                                                      # terraform.tfvars
-            data = _load_or_die_quietly(hcl_tfvars, self.out_parsing_errors)
+            self.external_variables_data.append((key[7:], value, f"env:{key}"))
+        if hcl_tfvars:  # terraform.tfvars
+            data = _load_or_die_quietly(hcl_tfvars, self.out_parsing_errors,
+                                        clean_definitions=False)
             if data:
-                var_value_and_file_map.update({k: (v, hcl_tfvars.path) for k, v in data.items()})
-        if json_tfvars:                                                     # terraform.tfvars.json
+                var_value_and_file_map.update({k: (_safe_index(v, 0), hcl_tfvars.path) for k, v in data.items()})
+                self.external_variables_data.extend([(k, _safe_index(v, 0), hcl_tfvars.path) for k, v in data.items()])
+        if json_tfvars:  # terraform.tfvars.json
             data = _load_or_die_quietly(json_tfvars, self.out_parsing_errors)
             if data:
                 var_value_and_file_map.update({k: (v, json_tfvars.path) for k, v in data.items()})
-        if auto_vars_files:                                                 # *.auto.tfvars / *.auto.tfvars.json
+                self.external_variables_data.extend([(k, v, json_tfvars.path) for k, v in data.items()])
+        if auto_vars_files:  # *.auto.tfvars / *.auto.tfvars.json
             for var_file in sorted(auto_vars_files, key=lambda e: e.name):
                 data = _load_or_die_quietly(var_file, self.out_parsing_errors)
                 if data:
                     var_value_and_file_map.update({k: (v, var_file.path) for k, v in data.items()})
-        if specified_vars:                                                  # specified
+                    self.external_variables_data.extend([(k, v, var_file.path) for k, v in data.items()])
+        if specified_vars:  # specified
             var_value_and_file_map.update({k: (v, "manual specification") for k, v in specified_vars.items()})
+            self.external_variables_data.extend([(k, v, "manual specification") for k, v in specified_vars.items()])
 
         # IMPLEMENTATION NOTE: When resolving `module.` references, access to the entire data map is needed. It
         #                      may be a little overboard, but I don't want to just pass the entire data map down
@@ -232,199 +270,67 @@ class Parser:
         #                      map for a particular module reference. (Might be OCD, but...)
         module_data_retrieval = lambda module_ref: self.out_definitions.get(module_ref)
 
-        # Stage 3: Variable resolution round 1 - no modules yet
-        if self.evaluate_variables:
-            self._process_vars_and_locals(directory, var_value_and_file_map, module_data_retrieval)
-
         # Stage 4: Load modules
-        self._load_modules(self.directory, module_loader_registry, dir_filter, module_load_context)
+        #          This stage needs to be done in a loop (again... alas, no DAG) because modules might not
+        #          be loadable until other modules are loaded. This happens when parameters to one module
+        #          depend on the output of another. For such cases, the base module must be loaded, then
+        #          a parameter resolution pass needs to happen, then the second module can be loaded.
+        #
+        #          One gotcha is that we need to make sure we load all modules at some point, even if their
+        #          parameters don't resolve. So, if we hit a spot where resolution doesn't change anything
+        #          and there are still modules to be loaded, they will be forced on the next pass.
+        force_final_module_load = False
+        for i in range(0, 10):  # circuit breaker - no more than 10 loops
+            logging.debug("Module load loop %d", i)
 
-        # Stage 5: Variable resolution round 2 - now with modules
-        if self.evaluate_variables:
-            self._process_vars_and_locals(directory, var_value_and_file_map, module_data_retrieval)
+            # Stage 4a: Load eligible modules
+            has_more_modules = self._load_modules(directory, module_loader_registry,
+                                                  dir_filter, module_load_context,
+                                                  keys_referenced_as_modules,
+                                                  force_final_module_load)
 
-    def _process_vars_and_locals(self, directory: str,
-                                 var_value_and_file_map: Dict[str, Tuple[Any, str]],
-                                 module_data_retrieval: Callable[[str], Dict[str, Any]]):
-        locals_values = {}
-        for file_data in self.out_definitions.values():
-            file_locals = file_data.get("locals")
-            if not file_locals:
-                continue
-            for k, v in file_locals[0].items():
-                locals_values[k] = v[0]
-
-        # Processing is done in a loop to deal with chained references and the like.
-        # Loop while the data is being changed, stop when no more changes are happening.
-        # To ensure there's not some kind of oscillation, a cap of 25 passes is in place.
-        # More than a couple loops isn't normally expected.
-        # NOTE: If this approach proves to be a performance liability, a DAG will be needed.
-        loop_count = 0
-        for i in range(0, 25):
-            loop_count += 1
-
-            made_change = False
-            # Put out file layer here so the context works inside the loop
-            for file, file_data in self.out_definitions.items():
-                eval_context_dict = self.out_evaluations_context.get(file)
-                if eval_context_dict is None:
-                    eval_context_dict = {}
-                    self.out_evaluations_context[file] = eval_context_dict
-                    # out_evaluations_context[os.path.join(directory, file)] = {
-                    #     var_name: EvaluationContext(os.path.relpath(file.path, directory))
-                    # }
-
-                if self._process_vars_and_locals_loop(file_data,
-                                                     eval_context_dict,
-                                                     os.path.relpath(file, directory),
-                                                     var_value_and_file_map, locals_values,
-                                                     file_data.get("resource"),
-                                                     file_data.get("module"),
-                                                     module_data_retrieval,
-                                                     directory):
-                    made_change = True
-
-                if len(eval_context_dict) == 0:
-                    del self.out_evaluations_context[file]
-            if not made_change:
-                break
-
-        LOGGER.debug("Processing variables took %d loop iterations", loop_count)
-
-    def _process_vars_and_locals_loop(self, out_definitions: Dict,
-                                      eval_map_by_var_name: Dict[str, EvaluationContext], relative_file_path: str,
-                                      var_value_and_file_map: Dict[str, Tuple[Any, str]],
-                                      locals_values: Dict[str, Any],
-                                      resource_list: Optional[List[Dict[str, Any]]],
-                                      module_list: Optional[List[Dict[str, Any]]],
-                                      module_data_retrieval: Callable[[str], Dict[str, Any]],
-                                      root_directory: str,
-                                      outer_context: str = "") -> bool:
-
-        # Generic loop for handling a source of key/value tuples (e.g., enumerate() or <dict>.items())
-        def process_items_helper(key_value_iterator, data_map, context, allow_str_bool_translation: bool):
-            made_change = False
-            for key, value in list(key_value_iterator()):       # Copy to list to allow deletion
-                new_context = f"{context}/{key}" if len(context) != 0 else key
-
-                if isinstance(value, str):
-                    altered_value = value
-
-                    had_pattern_match = False
-
-                    for match in _find_var_blocks(value):
-                        var_base = match.var_only
-
-                        # Expressions such as (from variable definition):
-                        #    type = string
-                        # are turned into:
-                        #    "type = ${string}"
-                        if var_base in _SIMPLE_TYPES and match.full_str == value:
-                            altered_value = var_base
-                            had_pattern_match = True
-                        else:
-                            replaced = _handle_single_var_pattern(var_base, var_value_and_file_map,
-                                                                  locals_values, resource_list,
-                                                                  module_list, module_data_retrieval,
-                                                                  eval_map_by_var_name,
-                                                                  new_context, value, root_directory)
-                            if replaced != var_base:
-                                if match.full_str == value:
-                                    altered_value = replaced
-                                else:
-                                    altered_value = altered_value.replace(match.full_str, str(replaced))
-                                had_pattern_match = True
-
-                    if not had_pattern_match:
-                        # tomap is annoying because the curly braces in the string break the regex. Rather than
-                        # coming up with something that's significantly more complex, we'll special case this
-                        # check. Only do this when there wasn't a pattern match to make sure there are no
-                        # variables lingering in the map value.
-                        # https://www.terraform.io/docs/configuration/functions/tomap.html
-                        if value.startswith("${tomap(") and value.endswith(")}"):
-                            trimmed = value[8:-2]
-                            trimmed = trimmed.replace(":", "=")     # converted to colons by parser #shrug
-                            altered_value = _eval_string(trimmed)
-                            if altered_value is None:
-                                altered_value = value
-                                continue
-
-                            if not isinstance(altered_value, dict):
-                                continue
-
-                            # If there is a string and anything else, convert to string
-                            had_string = False
-                            had_something_else = False
-                            for k, v in altered_value.items():
-                                if v == "${True}":
-                                    altered_value[k] = True
-                                    v = True
-                                elif v == "${False}":
-                                    altered_value[k] = False
-                                    v = False
-
-                                if isinstance(v, str):
-                                    had_string = True
-                                    if had_something_else:
-                                        break
-                                else:
-                                    had_something_else = True
-                                    if had_string:
-                                        break
-                            if had_string and had_something_else:
-                                altered_value = {k: _tostring(v) for k, v in altered_value.items()}
-                        # Same as above, regex can blow this up
-                        # (see parser scenario: tostring_function, INNER_CURLY
-                        elif value.startswith("${tostring(\"") and value.endswith("\")}"):
-                            altered_value = value[12:-3]
-
-                        # Support HCL 0.11 optional boolean syntax - evaluate "true" to true and "false" to false
-                        #
-                        # `allow_str_bool_translation` exists because we want to prevent conversion in a dict
-                        # which is a direct value. See the "MIXED_BOOL" variable in the "tomap_function" parser
-                        # scenario for a situation which worked incorrectly without this.
-                        # NOTE: This is probably not a big deal to be removed if this causes problems in other
-                        #       places. The MIXED_BOOL test case is technically correct with the TF spec, but
-                        #       isn't essential operation for Checkov.
-                        elif allow_str_bool_translation and value == "true":
-                            altered_value = True
-                        elif allow_str_bool_translation and value == "false":
-                            altered_value = False
-
-                    if value != altered_value:
-                        LOGGER.debug(f"Resolve: %s --> %s", value, altered_value)
-                        data_map[key] = altered_value
-                        made_change = True
-                elif isinstance(value, dict):
-                    if self._process_vars_and_locals_loop(value, eval_map_by_var_name, relative_file_path,
-                                                     var_value_and_file_map,
-                                                     locals_values, resource_list,
-                                                     module_list, module_data_retrieval, root_directory,
-                                                     new_context):
-                        made_change = True
-
-                elif isinstance(value, list):
-                    if len(value) > 0 and value[0] != value:
-                        if process_items_helper(lambda: enumerate(value), value, new_context, True):
-                            made_change = True
-                    # Some special cases that should be pruned from datasets
-                    if value == [None] or value == [{}] or value == [[]] or len(value) == 0:
-                        del data_map[key]
-            return made_change
-
-        return process_items_helper(out_definitions.items, out_definitions, outer_context, False)
+            # Stage 4b: Variable resolution round 2 - now with (possibly more) modules
+            made_var_changes = False
+            if not has_more_modules:
+                break  # nothing more to do
+            elif not made_var_changes:
+                # If there are more modules to load but no variables were resolved, then to a final module
+                # load, forcing things through without complete resolution.
+                force_final_module_load = True
 
     def _load_modules(self, root_dir: str, module_loader_registry: ModuleLoaderRegistry,
-                      dir_filter: Callable[[str], bool], module_load_context: Optional[str]):
+                      dir_filter: Callable[[str], bool], module_load_context: Optional[str],
+                      keys_referenced_as_modules: Set[str], ignore_unresolved_params: bool = False) -> bool:
+        """
+        Load modules which have not already been loaded and can be loaded (don't have unresolved parameters).
+
+        :param ignore_unresolved_params:    If true, not-yet-loaded modules will be loaded even if they are
+                                            passed parameters that are not fully resolved.
+        :return:                            True if there were modules that were not loaded due to unresolved
+                                            parameters.
+        """
         all_module_definitions = {}
         all_module_evaluations_context = {}
+        skipped_a_module = False
         for file in list(self.out_definitions.keys()):
+            # Don't process a file in a directory other than the directory we're processing. For example,
+            # if we're down dealing with <top_dir>/<module>/something.tf, we don't want to rescan files
+            # up in <top_dir>.
+            if os.path.dirname(file) != root_dir:
+                continue
+            # Don't process a file reference which has already been processed
+            if file.endswith("]"):
+                continue
+
             file_data = self.out_definitions.get(file)
+            if file_data is None:
+                continue
             module_calls = file_data.get("module")
             if not module_calls or not isinstance(module_calls, list):
                 continue
 
             for module_index, module_call in enumerate(module_calls):
+
                 if not isinstance(module_call, dict):
                     continue
 
@@ -433,14 +339,37 @@ class Parser:
                     if not isinstance(module_call_data, dict):
                         continue
 
+                    module_address = (file, module_index, module_call_name)
+                    if module_address in self._loaded_modules:
+                        continue
+
+                    # Variables being passed to module, "source" and "version" are reserved
+                    specified_vars = {k: v[0] if isinstance(v, list) else v for k, v in module_call_data.items()
+                                      if k != "source" and k != "version"}
+
+                    if not ignore_unresolved_params:
+                        has_unresolved_params = False
+                        for k, v in specified_vars.items():
+                            if not is_acceptable_module_param(v) or not is_acceptable_module_param(k):
+                                has_unresolved_params = True
+                                break
+                        if has_unresolved_params:
+                            skipped_a_module = True
+                            continue
+                    self._loaded_modules.add(module_address)
+
                     source = module_call_data.get("source")
                     if not source or not isinstance(source, list):
                         continue
                     source = source[0]
+                    if not isinstance(source, str):
+                        logging.debug(f"Skipping loading of {module_call_name} as source is not a string, it is: {source}")
+                        continue
 
                     # Special handling for local sources to make sure we aren't double-parsing
                     if source.startswith("./") or source.startswith("../"):
-                        source = os.path.normpath(os.path.join(os.path.dirname(_remove_module_dependency_in_path(file)), source))
+                        source = os.path.normpath(
+                            os.path.join(os.path.dirname(_remove_module_dependency_in_path(file)), source))
 
                     version = module_call_data.get("version", "latest")
                     if version and isinstance(version, list):
@@ -450,16 +379,15 @@ class Parser:
                             if not content.loaded():
                                 continue
 
-                            # Variables being passed to module, "source" and "version" are reserved
-                            specified_vars = {k: v[0] for k, v in module_call_data.items()
-                                              if k != "source" and k != "version"}
+                            self._internal_dir_load(directory=content.path(),
+                                                    module_loader_registry=module_loader_registry,
+                                                    dir_filter=dir_filter, specified_vars=specified_vars,
+                                                    module_load_context=module_load_context,
+                                                    keys_referenced_as_modules=keys_referenced_as_modules)
 
-                            if not dir_filter(os.path.abspath(content.path())):
-                                continue
-                            self._internal_dir_load(directory=content.path(), module_loader_registry=module_loader_registry,
-                                                    dir_filter=dir_filter, specified_vars=specified_vars, module_load_context=module_load_context)
-
-                            module_definitions = {path: self.out_definitions[path] for path in list(self.out_definitions.keys()) if os.path.dirname(path) == content.path()}
+                            module_definitions = {path: self.out_definitions[path] for path in
+                                                  list(self.out_definitions.keys()) if
+                                                  os.path.dirname(path) == content.path()}
 
                             if not module_definitions:
                                 continue
@@ -486,15 +414,16 @@ class Parser:
                             #       has not already been added.
                             keys = list(module_definitions.keys())
                             for key in keys:
-                                if key.endswith("]"):
+                                if key.endswith("]") or file.endswith("]"):
                                     continue
+                                keys_referenced_as_modules.add(key)
                                 new_key = f"{key}[{file}#{module_index}]"
-                                module_definitions[new_key] = \
-                                    module_definitions[key]
+                                module_definitions[new_key] = module_definitions[key]
                                 del module_definitions[key]
                                 del self.out_definitions[key]
-
-                                resolved_loc_list.append(new_key)
+                                if new_key not in resolved_loc_list:
+                                    resolved_loc_list.append(new_key)
+                            resolved_loc_list.sort()  # For testing, need predictable ordering
 
                             deep_merge.merge(all_module_definitions, module_definitions)
                     except Exception as e:
@@ -505,191 +434,183 @@ class Parser:
         if all_module_definitions:
             deep_merge.merge(self.out_definitions, all_module_definitions)
             deep_merge.merge(self.out_evaluations_context, all_module_evaluations_context)
+        return skipped_a_module
 
+    def parse_hcl_module(self, source_dir, source, download_external_modules=False, parsing_errors=None, excluded_paths: List[str]=None):
+        tf_definitions = {}
+        self.parse_directory(directory=source_dir, out_definitions=tf_definitions, out_evaluations_context={},
+                             out_parsing_errors=parsing_errors if parsing_errors is not None else {},
+                             download_external_modules=download_external_modules,
+                             external_modules_download_path=external_modules_download_path, excluded_paths=excluded_paths)
+        tf_definitions = self._clean_parser_types(tf_definitions)
+        tf_definitions = self._serialize_definitions(tf_definitions)
+        return self.parse_hcl_module_from_tf_definitions(tf_definitions, source_dir, source)
 
-def _handle_single_var_pattern(orig_variable: str, var_value_and_file_map: Dict[str, Tuple[Any, str]],
-                               locals_values: Dict[str, Any],
-                               resource_list: Optional[List[Dict[str, Any]]],
-                               module_list: Optional[List[Dict[str, Any]]],
-                               module_data_retrieval: Callable[[str], Dict[str, Any]],
-                               eval_map_by_var_name: Dict[str, EvaluationContext],
-                               context, orig_variable_full, root_directory: str) -> Any:
-    if "${" in orig_variable:
-        return orig_variable
-
-    elif orig_variable.startswith("module."):
-        if not module_list:
-            return orig_variable
-
-        # Reference to module outputs, example: 'module.bucket.bucket_name'
-        ref_tokens = orig_variable.split(".")
-        if len(ref_tokens) != 3:
-            return orig_variable        # fail safe, can the length ever be something other than 3?
-
-        try:
-            ref_list = jmespath.search(f"[].{ref_tokens[1]}.{RESOLVED_MODULE_ENTRY_NAME}[]", module_list)
-            #                                ^^^^^^^^^^^^^ module name
-
-            if not ref_list or not isinstance(ref_list, list):
-                return orig_variable
-
-            for ref in ref_list:
-                module_data = module_data_retrieval(ref)
-                if not module_data:
-                    continue
-
-                result = _handle_indexing(ref_tokens[2],
-                                          lambda r: jmespath.search(f"output[].{ref_tokens[2]}.value[] | [0]",
-                                                                    module_data))
-                if result:
-                    logging.debug("Resolved module ref:  %s --> %s", orig_variable, result)
-                    return result
-        except ValueError:
-            pass
-        return orig_variable
-
-    elif orig_variable == "True":
-        return True
-    elif orig_variable == "False":
-        return False
-
-    elif orig_variable.startswith("var."):
-        var_name = orig_variable[4:]
-        var_value_and_file = _handle_indexing(var_name, lambda r: var_value_and_file_map.get(r))
-        if var_value_and_file is not None:
-            var_value, var_file = var_value_and_file
-            eval_context = eval_map_by_var_name.get(var_name)
-            if eval_context is None:
-                eval_map_by_var_name[var_name] = EvaluationContext(os.path.relpath(var_file, root_directory),
-                                                                   var_value,
-                                                                   [VarReference(var_name,
-                                                                                 orig_variable_full,
-                                                                                 context)])
-            else:
-                eval_context.definitions.append(VarReference(var_name, orig_variable_full, context))
-            return var_value
-    elif orig_variable.startswith("local."):
-        var_value = _handle_indexing(orig_variable[6:], lambda r: locals_values.get(r))
-        if var_value is not None:
-            return var_value
-    elif orig_variable.startswith("to") and orig_variable.endswith(")"):
-        # https://www.terraform.io/docs/configuration/functions/tobool.html
-        if orig_variable.startswith("tobool("):
-            bool_variable = orig_variable[7:-1].lower()
-            bool_value = convert_str_to_bool(bool_variable)
-            if isinstance(bool_value, bool):
-                return bool_value
-            else:
-                return orig_variable
-        # https://www.terraform.io/docs/configuration/functions/tolist.html
-        elif orig_variable.startswith("tolist("):
-            altered_value = _eval_string(orig_variable[7:-1])
-            if altered_value is None:
-                return orig_variable
-            return altered_value if isinstance(altered_value, list) else list(altered_value)
-        # NOTE: tomap as handled outside this loop (see below)
-        # https://www.terraform.io/docs/configuration/functions/tonumber.html
-        elif orig_variable.startswith("tonumber("):
-            num_variable = orig_variable[9:-1]
-            if num_variable.startswith('"') and num_variable.endswith('"'):
-                num_variable = num_variable[1:-1]
-            try:
-                if "." in num_variable:
-                    return float(num_variable)
-                else:
-                    return int(num_variable)
-            except ValueError:
-                return orig_variable
-        # https://www.terraform.io/docs/configuration/functions/toset.html
-        elif orig_variable.startswith("toset("):
-            altered_value = _eval_string(orig_variable[6:-1])
-            if altered_value is None:
-                return orig_variable
-            return set(altered_value)
-        # https://www.terraform.io/docs/configuration/functions/tostring.html
-        elif orig_variable.startswith("tostring("):
-            altered_value = orig_variable[9:-1]
-            # Indicates a safe string, all good
-            if altered_value.startswith('"') and altered_value.endswith('"'):
-                return altered_value[1:-1]
-            # Otherwise, need to check for valid types (number or bool)
-            bool_value = convert_str_to_bool(altered_value)
-            if isinstance(bool_value, bool):
-                return bool_value
-            else:
+    def parse_hcl_module_from_tf_definitions(self, tf_definitions, source_dir, source, excluded_paths: List[str]=None):
+        module_dependency_map, tf_definitions, dep_index_mapping = self.get_module_dependency_map(tf_definitions)
+        module = self.get_new_module(source_dir, module_dependency_map, dep_index_mapping)
+        self.add_tfvars(module, source)
+        copy_of_tf_definitions = deepcopy(tf_definitions)
+        for file_path in copy_of_tf_definitions:
+            blocks = copy_of_tf_definitions.get(file_path)
+            for block_type in blocks:
                 try:
-                    if "." in altered_value:
-                        return str(float(altered_value))
-                    else:
-                        return str(int(altered_value))
-                except ValueError:
-                    return orig_variable     # no change
-    elif orig_variable.startswith("merge(") and orig_variable.endswith(")"):
-        altered_value = orig_variable[6:-1]
-        args = _split_merge_args(altered_value)
-        if args is None:
-            return orig_variable
-        merged_map = {}
-        for arg in args:
-            if arg.startswith("{"):
-                value = _map_string_to_native(arg)
-                if value is None:
-                    return orig_variable
+                    module.add_blocks(block_type, blocks[block_type], file_path, source)
+                except Exception as e:
+                    logging.error(f'Failed to add block {blocks[block_type]}. Error:')
+                    logging.error(e, exc_info=True)
+        return module, module_dependency_map, tf_definitions
+
+    @staticmethod
+    def _clean_parser_types(conf: dict) -> dict:
+        sorted_keys = list(conf.keys())
+        if len(conf.keys()) > 0 and all(isinstance(x, type(list(conf.keys())[0])) for x in conf.keys()):
+            sorted_keys = sorted(filter(lambda x: x is not None, conf.keys()))
+        # Create a new dict where the keys are sorted alphabetically
+        sorted_conf = {key: conf[key] for key in sorted_keys}
+        for attribute, values in sorted_conf.items():
+            if attribute == 'alias':
+                continue
+            if isinstance(values, list):
+                sorted_conf[attribute] = Parser._clean_parser_types_lst(values)
+            elif isinstance(values, dict):
+                sorted_conf[attribute] = Parser._clean_parser_types(conf[attribute])
+            elif isinstance(values, str) and values in ('true', 'false'):
+                sorted_conf[attribute] = True if values == 'true' else False
+            elif isinstance(values, set):
+                sorted_conf[attribute] = Parser._clean_parser_types_lst(list(values))
+            elif isinstance(values, Tree):
+                sorted_conf[attribute] = str(values)
+        return sorted_conf
+
+    @staticmethod
+    def _clean_parser_types_lst(values: list) -> list:
+        for i in range(len(values)):
+            val = values[i]
+            if isinstance(val, dict):
+                values[i] = Parser._clean_parser_types(val)
+            elif isinstance(val, list):
+                values[i] = Parser._clean_parser_types_lst(val)
+            elif isinstance(val, str):
+                if val == 'true':
+                    values[i] = True
+                elif val == 'false':
+                    values[i] = False
+            elif isinstance(val, set):
+                values[i] = Parser._clean_parser_types_lst(list(val))
+        str_values_in_lst = [val for val in values if isinstance(val, str)]
+        str_values_in_lst.sort()
+        result_values = [val for val in values if not isinstance(val, str)]
+        result_values.extend(str_values_in_lst)
+        return result_values
+
+    @staticmethod
+    def _serialize_definitions(tf_definitions):
+        return loads(dumps(tf_definitions, cls=DefinitionsEncoder))
+
+    @staticmethod
+    def get_next_vertices(evaluated_files: list, unevaluated_files: list) -> (list, list):
+        """
+        This function implements a lazy separation of levels for the evaluated files. It receives the evaluated
+        files, and returns 2 lists:
+        1. The next level of files - files from the unevaluated_files which have no unresolved dependency (either
+            no dependency or all dependencies were evaluated).
+        2. unevaluated - files which have yet to be evaluated, and still have pending dependencies
+
+        Let's say we have this dependency tree:
+        a -> b
+        x -> b
+        y -> c
+        z -> b
+        b -> c
+        c -> d
+
+        The first run will return [a, y, x, z] as the next level since all of them have no dependencies
+        The second run with the evaluated being [a, y, x, z] will return [b] as the next level.
+        Please mind that [c] has some resolved dependencies (from y), but has unresolved dependencies from [b].
+        The third run will return [c], and the fourth will return [d].
+        """
+        next_level, unevaluated, do_not_eval_yet = [], [], []
+        for key in unevaluated_files:
+            found = False
+            for eval_key in evaluated_files:
+                if eval_key in key:
+                    found = True
+                    break
+            if not found:
+                do_not_eval_yet.append(key.split('[')[0])
+                unevaluated.append(key)
             else:
-                value = _handle_single_var_pattern(arg,
-                                                   var_value_and_file_map,
-                                                   locals_values,
-                                                   resource_list,
-                                                   module_list,
-                                                   module_data_retrieval,
-                                                   eval_map_by_var_name,
-                                                   context,
-                                                   arg,
-                                                   root_directory)
-            if isinstance(value, dict):
-                merged_map.update(value)
-            else:
-                return orig_variable            # don't know what this is, blow out
-        return merged_map
-    # TODO - format() support, still in progress
-    # elif orig_variable.startswith("format(") and orig_variable.endswith(")"):
-    #     format_tokens = orig_variable[7:-1].split(",")
-    #     return format_tokens[0].format([_to_native_value(t) for t in format_tokens[1:]])
+                next_level.append(key)
 
-    elif _RESOURCE_REF_PATTERN.match(orig_variable):
-        # Reference to resources, example: 'aws_s3_bucket.example.bucket'
-        # TODO: handle index into map/list
-        try:
-            result = jmespath.search(f"[].{orig_variable}[] | [0]", resource_list)
-        except ValueError:
-            pass
-        else:
-            if result is not None:
-                return result
+        move_to_uneval = list(filter(lambda k: k.split('[')[0] in do_not_eval_yet, next_level))
+        for k in move_to_uneval:
+            next_level.remove(k)
+            unevaluated.append(k)
+        return next_level, unevaluated
 
-    return orig_variable        # fall back to no change
+    @staticmethod
+    def get_module_dependency_map(tf_definitions):
+        """
+        :param tf_definitions, with paths in format 'dir/main.tf[module_dir/main.tf#0]'
+        :return module_dependency_map: mapping between directories and the location of its module definition:
+                {'dir': 'module_dir/main.tf'}
+        :return tf_definitions: with paths in format 'dir/main.tf'
+        """
+        module_dependency_map = {}
+        copy_of_tf_definitions = {}
+        dep_index_mapping = {}
+        definitions_keys = list(tf_definitions.keys())
+        origin_keys = list(filter(lambda k: not k.endswith(']'), definitions_keys))
+        unevaluated_keys = list(filter(lambda k: k.endswith(']'), definitions_keys))
+        for file_path in origin_keys:
+            dir_name = os.path.dirname(file_path)
+            module_dependency_map[dir_name] = [[]]
+            copy_of_tf_definitions[file_path] = deepcopy(tf_definitions[file_path])
+
+        next_level, unevaluated_keys = Parser.get_next_vertices(origin_keys, unevaluated_keys)
+        while next_level:
+            for file_path in next_level:
+                path, module_dependency, module_dependency_num = remove_module_dependency_in_path(file_path)
+                dir_name = os.path.dirname(path)
+                current_deps = deepcopy(module_dependency_map[os.path.dirname(module_dependency)])
+                for dep in current_deps:
+                    dep.append(module_dependency)
+                if dir_name not in module_dependency_map:
+                    module_dependency_map[dir_name] = current_deps
+                elif current_deps not in module_dependency_map[dir_name]:
+                    module_dependency_map[dir_name] += current_deps
+                copy_of_tf_definitions[path] = deepcopy(tf_definitions[file_path])
+                origin_keys.append(path)
+                dep_index_mapping[path] = module_dependency_num
+            next_level, unevaluated_keys = Parser.get_next_vertices(origin_keys, unevaluated_keys)
+        for key, dep_trails in module_dependency_map.items():
+            hashes = set()
+            deduped = []
+            for trail in dep_trails:
+                hash = unify_dependency_path(trail)
+                if hash in hashes:
+                    continue
+                hashes.add(hash)
+                deduped.append(trail)
+            module_dependency_map[key] = deduped
+        return module_dependency_map, copy_of_tf_definitions, dep_index_mapping
+
+    @staticmethod
+    def get_new_module(source_dir, module_dependency_map, dep_index_mapping):
+        return Module(source_dir, module_dependency_map, dep_index_mapping)
+
+    def add_tfvars(self, module, source):
+        if not self.external_variables_data:
+            return
+        for (var_name, default, path) in self.external_variables_data:
+            if ".tfvars" in path:
+                block = {var_name: {"default": default}}
+                module.add_blocks(BlockType.TF_VARIABLE, block, path, source)
 
 
-def _handle_indexing(reference: str, data_source: Callable[[str], Optional[Any]]) -> Optional[Any]:
-    if reference.endswith("]") and "[" in reference:
-        base_ref = reference[:reference.rindex("[")]
-        value = data_source(base_ref)
-        reference_val = reference[reference.rindex("[") + 1: -1]
-        if isinstance(value, dict):
-            return value.get(reference_val)
-        elif isinstance(value, list):
-            try:
-                return value[int(reference_val)]
-            except ValueError as e:
-                # TODO: handle count.index correctly
-                logging.debug(f'Failed to parse index int out of {reference_val}')
-                logging.debug(e, stack_info=True)
-                return
-    else:
-        return data_source(reference)
-
-
-def _load_or_die_quietly(file: os.PathLike, parsing_errors: Dict) -> Optional[Mapping]:
+def _load_or_die_quietly(file: os.PathLike, parsing_errors: Dict,
+                         clean_definitions: bool = True) -> Optional[Mapping]:
     """
 Load JSON or HCL, depending on filename.
     :return: None if the file can't be loaded
@@ -699,54 +620,55 @@ Load JSON or HCL, depending on filename.
     file_name = os.path.basename(file_path)
 
     try:
+        logging.debug(f"Parsing {file_path}")
         with open(file, "r") as f:
             if file_name.endswith(".json"):
-                return _clean_bad_definitions(json.load(f))
+                return json.load(f)
             else:
-                return _clean_bad_definitions(hcl2.load(f))
+                raw_data = hcl2.load(f)
+                non_malformed_definitions = _validate_malformed_definitions(raw_data)
+                if clean_definitions:
+                    return _clean_bad_definitions(non_malformed_definitions)
+                else:
+                    return non_malformed_definitions
     except Exception as e:
-        LOGGER.debug(f'failed while parsing file {file}', exc_info=e)
+        logging.debug(f'failed while parsing file {file_path}', exc_info=e)
         parsing_errors[file_path] = e
         return None
 
 
+def _is_valid_block(block):
+    if not isinstance(block, dict):
+        return True
+    entity_name, _ = next(iter(block.items()))
+    if re.fullmatch(r'[^\W0-9][\w-]*', entity_name):
+        return True
+    return False
+
+
+def _validate_malformed_definitions(raw_data):
+    raw_data_cleaned = copy.deepcopy(raw_data)
+    for block_type, blocks in raw_data.items():
+        raw_data_cleaned[block_type] = [block for block in blocks if _is_valid_block(block)]
+
+    return raw_data_cleaned
+
+
 def _clean_bad_definitions(tf_definition_list):
     return {
-        block_type: list(filter(lambda definition_list: block_type == 'locals' or len(definition_list.keys()) == 1, tf_definition_list[block_type]))
+        block_type: list(filter(lambda definition_list: block_type == 'locals' or
+                                                        not isinstance(definition_list, dict)
+                                                        or len(definition_list.keys()) == 1,
+                                tf_definition_list[block_type]))
         for block_type in tf_definition_list.keys()
     }
-
-
-def _eval_string(value: str) -> Optional[Any]:
-    try:
-        value_string = value.replace("'", '"')
-        parsed = hcl2.loads(f'eval = {value_string}\n')      # NOTE: newline is needed
-        return parsed["eval"][0]
-    except Exception:
-        return None
 
 
 def _to_native_value(value: str) -> Any:
     if value.startswith('"') or value.startswith("'"):
         return value[1:-1]
     else:
-        return _eval_string(value)
-
-
-def _tostring(value: Any) -> str:
-    if value is True:
-        return "true"
-    elif value is False:
-        return "false"
-    return str(value)
-
-
-def _map_string_to_native(value: str) -> Optional[Dict]:
-    try:
-        value_string = value.replace("'", '"')
-        return json.loads(value_string)
-    except Exception:
-        return None
+        return eval_string(value)
 
 
 def _remove_module_dependency_in_path(path):
@@ -760,153 +682,37 @@ def _remove_module_dependency_in_path(path):
     return path
 
 
-def _split_merge_args(value: str) -> Optional[List[str]]:
-    """
-    Split arguments of a merge function. For example, "merge(local.one, local.two)" would
-    call this function with a value of "local.one, local.two" which would return
-    ["local.one", "local.two"]. If the value cannot be unpacked, None will be returned.
-    """
-    if not value:
+def _safe_index(sequence_hopefully, index) -> Optional[Any]:
+    try:
+        return sequence_hopefully[index]
+    except IndexError as e:
+        logging.debug(f'Failed to parse index int ({index}) out of {sequence_hopefully}')
+        logging.debug(e, stack_info=True)
         return None
 
-    # There are a number of splitting scenarios depending on whether variables or
-    # direct maps are used:
-    #           merge({tag1="foo"},{tag2="bar"})
-    #           merge({tag1="foo"},local.some_tags)
-    #           merge(local.some_tags,{tag2="bar"})
-    #           merge(local.some_tags,local.some_other_tags)
-    # Also, the number of arguments can vary, things can be nested, strings are evil...
-    # See tests/terraform/test_parser_internals.py for many examples.
 
-    to_return = []
-    current_arg_buffer = ""
-    processing_str_escape = False
-    inside_collection_stack = []        # newest at position 0, contains the terminator for the collection
-    for c in value:
-        if c == "," and not inside_collection_stack:
-            current_arg_buffer = current_arg_buffer.strip()
-            # Note: can get a zero-length buffer when there's a double comman. This can
-            #       happen with multi-line args (see parser_internals test)
-            if len(current_arg_buffer) != 0:
-                to_return.append(current_arg_buffer)
-            current_arg_buffer = ""
-        else:
-            current_arg_buffer += c
-
-        processing_str_escape = _str_parser_loop_collection_helper(c,
-                                                                   inside_collection_stack,
-                                                                   processing_str_escape)
-
-    current_arg_buffer = current_arg_buffer.strip()
-    if len(current_arg_buffer) > 0:
-        to_return.append(current_arg_buffer)
-
-    if len(to_return) == 0:
-        return None
-    return to_return
-
-
-@dataclass
-class VarBlockMatch:
-    full_str: str       # Example: ${local.foo}
-    var_only: str       # Example: local.fop
-
-
-def _find_var_blocks(value: str) -> List[VarBlockMatch]:
+def is_acceptable_module_param(value: Any) -> bool:
     """
-    Find and return all the var blocks within a given string.
+    This function determines if a value should be passed to a module as a parameter. We don't want to pass
+    unresolved var, local or module references because they can't be resolved from the module, so they need
+    to be resolved prior to being passed down.
     """
+    value_type = type(value)
+    if value_type is dict:
+        for k, v in value.items():
+            if not is_acceptable_module_param(v) or not is_acceptable_module_param(k):
+                return False
+        return True
+    if value_type is set or value_type is list:
+        for v in value:
+            if not is_acceptable_module_param(v):
+                return False
+        return True
 
-    # Note: This used to be implemented with a regex: r'\${([^{}]+?)}')
-    #       That found ${...} without a {} inside. However, this caused issues with things containing maps
-    #       which needed to be processed.
+    if not value_type is str:
+        return True
 
-    to_return: List[VarBlockMatch] = []
-    eval_buffer = ""
-    in_eval = False
-    preceding_dollar = False
-    processing_str_escape = False
-    inside_collection_stack: List[str] = []        # newest at position 0, contains terminator for collection
-    for c in value:
-        if c == "$":
-            if preceding_dollar:        # ignore double $
-                preceding_dollar = False
-                continue
-            preceding_dollar = True
-        elif c == "{" and preceding_dollar:
-            # NOTE: An eval block can start within another eval block, in which case we drop the old
-            #       stuff and process this one.
-            in_eval = True
-            eval_buffer = ""                    # reset buffer
-            inside_collection_stack.clear()     # reset stack
-            processing_str_escape = False
-            preceding_dollar = False
-            continue
-        else:
-            preceding_dollar = False
-
-        if not in_eval:
-            continue
-
-        if c == "}" and not inside_collection_stack:
-            eval_buffer = eval_buffer.strip()
-            if len(eval_buffer) == 0:
-                # Something went wrong because we have an empty arg. Blow out.
-                return []
-            to_return.append(VarBlockMatch("${" + eval_buffer + "}", eval_buffer))
-            eval_buffer = ""
-            in_eval = False
-            continue
-        else:
-            eval_buffer += c
-
-        processing_str_escape = _str_parser_loop_collection_helper(c, inside_collection_stack,
-                                                                   processing_str_escape)
-
-    return to_return
-
-
-def _str_parser_loop_collection_helper(c: str, inside_collection_stack: List[str],
-                                       processing_str_escape: bool) -> bool:
-    """
-    This function handles dealing with tracking when a char-by-char state loop is inside a
-    "collection" (map, array index, method args, string).
-
-    :param c:       Active character
-    :param inside_collection_stack:     Stack of terminators for collections. This will be modified by
-                                        this function. The active terminator will be at position 0.
-
-
-    :return: value to set for `processing_str_escape`
-    """
-    inside_a_string = False
-    if inside_collection_stack:
-        terminator = inside_collection_stack[0]
-
-        if terminator == '"' or terminator == "'":
-            if processing_str_escape:
-                processing_str_escape = False
-                return processing_str_escape
-            elif c == "\\":
-                processing_str_escape = True
-                return processing_str_escape
-            else:
-                inside_a_string = True
-
-        if c == terminator:
-            del inside_collection_stack[0]
-            return processing_str_escape
-
-    if not inside_a_string:
-        if c == '"':
-            inside_collection_stack.insert(0, '"')
-        elif c == "'":
-            inside_collection_stack.insert(0, "'")
-        elif c == "{":
-            inside_collection_stack.insert(0, "}")
-        elif c == "[":
-            inside_collection_stack.insert(0, "]")
-        elif c == "(":
-            inside_collection_stack.insert(0, ")")
-
-    return processing_str_escape
+    for vbm in find_var_blocks(value):
+        if vbm.is_simple_var():
+            return False
+    return True
