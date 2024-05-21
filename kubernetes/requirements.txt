@@ -1,1 +1,2 @@
 checkov==1.0.717
+requests>=2.32.0 # not directly required, pinned by Snyk to avoid a vulnerability
